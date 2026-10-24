@@ -17,8 +17,8 @@ The simulator supports Linux and macOS. These instructions use a Unix shell. Run
 Clone the repository and install the Python dependencies:
 
 ```bash
-git clone https://github.com/Nixon080304/eureka-3.git
-cd eureka-3
+git clone https://github.com/Nixon080304/eureka-assignment.git
+cd eureka-assignment
 uv sync --locked
 ```
 

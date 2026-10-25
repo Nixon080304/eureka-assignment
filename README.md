@@ -2,6 +2,14 @@
 
 A Python application for the Eureka Robotics robot vacuum simulator. It plans paths with A*, drives the robot using wheel commands, and uses depth images to detect obstacles missing from the supplied map. The Qt interface shows the map, robot trajectory, goals, planned path, and RGBD camera previews.
 
+## Demo
+
+The 4-minute demo shows navigation to one goal in each scene, `01`–`06`, using seed `18`.
+
+https://github.com/user-attachments/assets/f979e5b6-ffc9-45c1-a68a-06e0cd5773a1
+
+[View the MP4 file](deliverables/demo.mp4).
+
 ## Requirements
 
 - Python 3.10 or newer.

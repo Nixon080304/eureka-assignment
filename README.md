@@ -128,4 +128,4 @@ The assignment's arrival limits are 5 cm in position and 5 degrees for goals wit
 
 ## AI assistance
 
-I used OpenAI Codex to brainstorm motion planning and control algorithms, review and validate the code whether it matches the requirements, and prepare documentation.
+I used OpenAI Codex to brainstorm motion planning and control algorithms, review and validate the code whether it matches the requirements, debugging, running verification, and prepare documentation.

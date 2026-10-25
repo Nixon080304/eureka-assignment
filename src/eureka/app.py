@@ -5,7 +5,7 @@ from .runtime import Runtime
 from .ui import MainWindow
 
 
-def main(port_base=5555):
+def main(port_base: int = 5555) -> int:
     app = QApplication([])
     runtime = Runtime(port_base=port_base)
     window = MainWindow(runtime)
@@ -23,7 +23,7 @@ def main(port_base=5555):
     finally:
         runtime.close()
         window.deleteLater()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 if __name__ == "__main__":

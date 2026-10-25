@@ -1,18 +1,25 @@
 """Conservative occupancy planning and capture-pose RGBD obstacle mapping."""
 
+from __future__ import annotations
+
 import heapq
 import math
 
 import numpy as np
+from numpy.typing import NDArray
 from scipy.ndimage import distance_transform_edt, maximum_filter
 from scipy.spatial import cKDTree
+
+from .domain import CameraPacket, JsonDict, MapGrid, Point, Pose, Velocity
 
 
 class NoPath(ValueError):
     """The requested goal cannot be reached with the required clearance."""
 
 
-def project_obstacles(packet, calibration, height=0.09):
+def project_obstacles(
+    packet: CameraPacket, calibration: JsonDict, height: float = 0.09
+) -> NDArray[np.float64]:
     """Return world points within the robot's collision height band.
 
     Depth is optical-axis distance. The transform and pose belong to the
@@ -47,7 +54,9 @@ def project_obstacles(packet, calibration, height=0.09):
 class GridPlanner:
     """Own the static map, confirmed obstacles, and cached configuration space."""
 
-    def __init__(self, grid, radius=0.17, margin=0.03, height=0.09):
+    def __init__(
+        self, grid: MapGrid, radius: float = 0.17, margin: float = 0.03, height: float = 0.09
+    ) -> None:
         if radius <= 0 or height <= 0 or margin < 0 or grid.resolution <= 0:
             raise ValueError("Radius and resolution must be positive; margin must be nonnegative")
         if grid.occupied.ndim != 2 or not grid.occupied.size:
@@ -59,17 +68,17 @@ class GridPlanner:
         self.dynamic = np.zeros(grid.occupied.shape, dtype=bool)
         self.revision = 0
         self._evidence = np.zeros(grid.occupied.shape, dtype=np.uint8)
-        self._last_camera = None
+        self._last_camera: tuple[float, int] | None = None
         self._cache_revision = -1
         self._blocked = np.empty_like(self.dynamic)
-        self._tree = None
+        self._tree: cKDTree | None = None
         if grid.occupied.any():
             free_cells = ~grid.occupied.astype(bool)
             self._static_distance = distance_transform_edt(free_cells) * grid.resolution
         else:
             self._static_distance = np.full(grid.occupied.shape, np.inf)
 
-    def _refresh(self):
+    def _refresh(self) -> None:
         if self._cache_revision == self.revision:
             return
         occupied = self.grid.occupied.astype(bool) | self.dynamic
@@ -84,8 +93,10 @@ class GridPlanner:
         distance_from_left = (cols + 0.5) * resolution
         distance_from_bottom = (self.grid.height - rows - 0.5) * resolution
         distance_from_right = (self.grid.width - cols - 0.5) * resolution
-        boundary = np.minimum.reduce(
-            (distance_from_top, distance_from_left, distance_from_bottom, distance_from_right)
+        boundary = np.empty_like(distance_from_top)
+        np.minimum.reduce(
+            (distance_from_top, distance_from_left, distance_from_bottom, distance_from_right),
+            out=boundary,
         )
         self._blocked |= boundary < required_clearance
 
@@ -100,11 +111,11 @@ class GridPlanner:
         self._cache_revision = self.revision
 
     @property
-    def blocked(self):
+    def blocked(self) -> NDArray[np.bool_]:
         self._refresh()
         return self._blocked
 
-    def _clearance(self, point):
+    def _clearance(self, point: Point) -> float:
         self._refresh()
         x, y = point
         ox, oy = self.grid.origin
@@ -125,7 +136,7 @@ class GridPlanner:
             clearance = min(clearance, obstacle_distance)
         return clearance
 
-    def segment_clear(self, start, end):
+    def segment_clear(self, start: Point, end: Point) -> bool:
         """Check a swept disc, including a monotone escape from reduced margin."""
         for coordinate in (*start, *end):
             if not math.isfinite(coordinate):
@@ -164,13 +175,13 @@ class GridPlanner:
 
     def motion_clear(
         self,
-        pose,
-        linear,
-        angular,
-        velocity=(0.0, 0.0),
-        acceleration=(1.0, 6.0),
-        horizon=0.25,
-    ):
+        pose: Pose,
+        linear: float,
+        angular: float,
+        velocity: Velocity = (0.0, 0.0),
+        acceleration: tuple[float, float] = (1.0, 6.0),
+        horizon: float = 0.25,
+    ) -> bool:
         """Check the commanded arc and braking path from measured wheel velocity.
 
         Simulate the watchdog interval before braking at the published acceleration
@@ -205,7 +216,7 @@ class GridPlanner:
                 return True
         return False
 
-    def _segment_clearance(self, start, end):
+    def _segment_clearance(self, start: Point, end: Point) -> float:
         self._refresh()
         a = np.asarray(start)
         b = np.asarray(end)
@@ -261,7 +272,7 @@ class GridPlanner:
                 minimum = np.minimum(minimum, distances)
         return min(clearance, float(minimum.min()))
 
-    def plan(self, start, goal):
+    def plan(self, start: Point, goal: Point) -> list[Point]:
         """Return safe waypoints, including the exact requested endpoint."""
         for coordinate in (*start, *goal):
             if not math.isfinite(coordinate):
@@ -279,7 +290,7 @@ class GridPlanner:
             return self._subdivide([start, goal])
         frontier = [(math.dist(source, target), 0.0, source)]
         costs = {source: 0.0}
-        parents = {}
+        parents: dict[tuple[int, int], tuple[int, int]] = {}
         while frontier:
             _, cost, cell = heapq.heappop(frontier)
             if cost != costs[cell]:
@@ -333,7 +344,7 @@ class GridPlanner:
                     )
         raise NoPath("No collision-free route connects the start and goal")
 
-    def _smooth(self, points):
+    def _smooth(self, points: list[Point]) -> list[Point]:
         result = [points[0]]
         index = 0
         while index < len(points) - 1:
@@ -349,7 +360,7 @@ class GridPlanner:
         return result
 
     @staticmethod
-    def _subdivide(points):
+    def _subdivide(points: list[Point]) -> list[Point]:
         result = [points[0]]
         for start, end in zip(points, points[1:]):
             count = max(1, math.ceil(math.dist(start, end) / 0.5))
@@ -360,7 +371,7 @@ class GridPlanner:
         result[-1] = points[-1]
         return result
 
-    def update_depth(self, packet, calibration):
+    def update_depth(self, packet: CameraPacket, calibration: JsonDict) -> int:
         """Confirm spatially supported returns observed in two distinct captures."""
         identity = (packet.t, packet.seq)
         if self._last_camera is not None and identity <= self._last_camera:

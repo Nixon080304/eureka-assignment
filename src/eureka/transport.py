@@ -1,15 +1,16 @@
-"""A step-by-step version of transport.py with the same simulator interface."""
+from __future__ import annotations
 
 import io
 import json
 import math
 import time
+from typing import Any, cast
 
 import numpy as np
 import zmq
 from PIL import Image
 
-from .domain import CameraPacket, MapGrid, Pose
+from .domain import CameraPacket, JsonDict, MapGrid, Point, Pose
 
 
 class RpcError(RuntimeError):
@@ -17,14 +18,14 @@ class RpcError(RuntimeError):
 
 
 class Simulator:
-    def __init__(self, host="localhost", port_base=5555):
+    def __init__(self, host: str = "localhost", port_base: int = 5555) -> None:
         self.host = host
         self.port_base = port_base
         self.context = zmq.Context()
 
-        self.rpc_socket = None
-        self.state_socket = None
-        self.camera_socket = None
+        self.rpc_socket: zmq.Socket[bytes] | None = None
+        self.state_socket: zmq.Socket[bytes] | None = None
+        self.camera_socket: zmq.Socket[bytes] | None = None
 
         self.command = self.context.socket(zmq.PUSH)
         self.command.setsockopt(zmq.LINGER, 0)
@@ -35,11 +36,11 @@ class Simulator:
         self._new_rpc()
         self.restart_streams()
 
-    def url(self, offset):
+    def url(self, offset: int) -> str:
         port = self.port_base + offset
         return f"tcp://{self.host}:{port}"
 
-    def _new_rpc(self):
+    def _new_rpc(self) -> None:
         if self.rpc_socket is not None:
             self.rpc_socket.close(0)
 
@@ -48,9 +49,10 @@ class Simulator:
         self.rpc_socket.setsockopt(zmq.SNDTIMEO, 1500)
         self.rpc_socket.connect(self.url(0))
 
-    def call(self, method, timeout=1500, **params):
+    def call(self, method: str, timeout: int = 1500, **params: Any) -> tuple[Any, list[bytes]]:
         request = {"method": method, "params": params}
 
+        assert self.rpc_socket is not None
         try:
             self.rpc_socket.send_json(request)
 
@@ -73,7 +75,7 @@ class Simulator:
             message = f"{method} failed or timed out; outcome may be unknown"
             raise RpcError(message) from error
 
-    def restart_streams(self):
+    def restart_streams(self) -> None:
         if self.state_socket is not None:
             self.state_socket.close(0)
         if self.camera_socket is not None:
@@ -92,7 +94,7 @@ class Simulator:
         self.camera_socket.setsockopt(zmq.SUBSCRIBE, b"")
         self.camera_socket.connect(self.url(3))
 
-    def wheels(self, left=0.0, right=0.0):
+    def wheels(self, left: float = 0.0, right: float = 0.0) -> bool:
         if not math.isfinite(left) or not math.isfinite(right):
             raise ValueError("Wheel command contains a non-finite value")
 
@@ -104,8 +106,9 @@ class Simulator:
         except zmq.Again:
             return False
 
-    def states(self):
-        messages = []
+    def states(self) -> list[JsonDict]:
+        assert self.state_socket is not None
+        messages: list[JsonDict] = []
 
         for _ in range(250):
             try:
@@ -129,8 +132,9 @@ class Simulator:
 
         return messages
 
-    def cameras(self):
-        packets = []
+    def cameras(self) -> list[CameraPacket]:
+        assert self.camera_socket is not None
+        packets: list[CameraPacket] = []
 
         for _ in range(24):
             try:
@@ -165,7 +169,7 @@ class Simulator:
 
         return packets
 
-    def get_map(self):
+    def get_map(self) -> tuple[MapGrid, JsonDict, bytes]:
         metadata, frames = self.call("get_map")
         if len(frames) != 1:
             raise ValueError("Map response must contain one PNG")
@@ -187,10 +191,10 @@ class Simulator:
         for coordinate in metadata["origin"]:
             origin.append(float(coordinate))
 
-        grid = MapGrid(occupied, resolution, tuple(origin))
+        grid = MapGrid(occupied, resolution, cast(Point, tuple(origin)))
         return grid, metadata, frames[0]
 
-    def close(self):
+    def close(self) -> None:
         self.wheels()
 
         sockets = (self.rpc_socket, self.command, self.state_socket, self.camera_socket)

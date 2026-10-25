@@ -1,18 +1,26 @@
 """Minimal Qt controls, map, and RGBD previews."""
 
+from __future__ import annotations
+
 import math
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PySide6 import QtWidgets as widgets
 from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QImage, QPainterPath, QPen, QPixmap
+
+from .domain import Goal, Snapshot
+
+if TYPE_CHECKING:
+    from .runtime import Runtime
 
 
 class MainWindow(widgets.QMainWindow):
-    def __init__(self, runtime):
+    def __init__(self, runtime: Runtime) -> None:
         super().__init__()
         self.runtime = runtime
-        self.goal_key = None
+        self.goal_key: tuple[int, tuple[Goal, ...], tuple[str, ...]] | None = None
         self.setWindowTitle("Eureka - minimal UI")
         self.resize(1100, 720)
         self.setStyleSheet("QWidget {background:#17232d; color:#eeeeee;}")
@@ -43,11 +51,13 @@ class MainWindow(widgets.QMainWindow):
         body.addWidget(self.map_canvas, 2)
         cameras = widgets.QVBoxLayout()
         self.rgb = widgets.QLabel("RGB")
-        self.depth = widgets.QLabel("Depth: near bright, far dark")
-        for label in (self.rgb, self.depth):
-            label.setAlignment(Qt.AlignCenter)
+        self.depth_preview = widgets.QLabel("Depth: near bright, far dark")
+        for label in (self.rgb, self.depth_preview):
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setMinimumSize(240, 160)
-            label.setSizePolicy(widgets.QSizePolicy.Ignored, widgets.QSizePolicy.Ignored)
+            label.setSizePolicy(
+                widgets.QSizePolicy.Policy.Ignored, widgets.QSizePolicy.Policy.Ignored
+            )
             cameras.addWidget(label)
         body.addLayout(cameras, 1)
         layout.addLayout(body, 1)
@@ -57,8 +67,8 @@ class MainWindow(widgets.QMainWindow):
         self.folder = widgets.QLineEdit("recordings")
         self.record_button = widgets.QPushButton("Start recording")
         self.record_button.clicked.connect(self.record)
-        for widget in (self.folder, self.record_button):
-            recording.addWidget(widget)
+        for record_widget in (self.folder, self.record_button):
+            recording.addWidget(record_widget)
         layout.addLayout(recording)
         self.record_info = widgets.QLabel()
         self.record_info.setWordWrap(True)
@@ -71,35 +81,36 @@ class MainWindow(widgets.QMainWindow):
         self.timer.start(100)
         self.refresh()
 
-    def submit(self, action, **kwargs):
+    def submit(self, action: str, **kwargs: Any) -> None:
         try:
             self.runtime.submit(action, **kwargs)
         except Exception as error:
             self.detail.setText(str(error))
 
-    def load_scene(self):
+    def load_scene(self) -> None:
         self.submit("load_scene", scene=self.scene.currentText(), seed=self.seed.value())
 
-    def navigate(self):
+    def navigate(self) -> None:
         self.submit("navigate", name=self.goals.currentData())
 
-    def stop_robot(self):
+    def stop_robot(self) -> None:
         self.submit("stop")
 
-    def record(self):
+    def record(self) -> None:
         if self.runtime.snapshot().recording.get("active"):
             self.submit("stop_recording")
         else:
             self.submit("start_recording", directory=self.folder.text().strip() or "recordings")
 
-    def world_point(self, x, y):
+    def world_point(self, x: float, y: float) -> QPointF:
         grid = self.snapshot.grid
+        assert grid is not None
         return QPointF(
             (x - grid.origin[0]) / grid.resolution,
             grid.height - (y - grid.origin[1]) / grid.resolution,
         )
 
-    def draw_map(self, snapshot):
+    def draw_map(self, snapshot: Snapshot) -> None:
         self.map_scene.clear()
         grid = snapshot.grid
         if grid is None:
@@ -110,15 +121,15 @@ class MainWindow(widgets.QMainWindow):
         if snapshot.dynamic is not None:
             pixels[snapshot.dynamic] = (255, 156, 85)
         image = QImage(
-            pixels.data, grid.width, grid.height, pixels.strides[0], QImage.Format_RGB888
+            pixels.data, grid.width, grid.height, pixels.strides[0], QImage.Format.Format_RGB888
         ).copy()
         self.map_scene.addPixmap(QPixmap.fromImage(image))
-        for points, color in ((snapshot.trajectory, "#679ac6"), (snapshot.path, "#52d8c6")):
+        for points, path_color in ((snapshot.trajectory, "#679ac6"), (snapshot.path, "#52d8c6")):
             if points:
                 path = QPainterPath(self.world_point(*points[0]))
-                for point in points[1:]:
-                    path.lineTo(self.world_point(*point))
-                self.map_scene.addPath(path, QPen(QColor(color), 1.5))
+                for waypoint in points[1:]:
+                    path.lineTo(self.world_point(*waypoint))
+                self.map_scene.addPath(path, QPen(QColor(path_color), 1.5))
         for goal in snapshot.goals:
             point = self.world_point(goal.x, goal.y)
             color = QColor("#52d8c6" if goal.name in snapshot.marked else "#f3cc76")
@@ -132,13 +143,13 @@ class MainWindow(widgets.QMainWindow):
             radius = 0.17 / grid.resolution
             bounds = QRectF(-radius, -radius, radius * 2, radius * 2)
             bounds.moveCenter(point)
-            self.map_scene.addEllipse(bounds, QPen(Qt.white), QBrush(QColor("#258d87")))
+            self.map_scene.addEllipse(bounds, QPen(Qt.GlobalColor.white), QBrush(QColor("#258d87")))
             heading = point + QPointF(math.cos(pose.yaw), -math.sin(pose.yaw)) * radius * 1.5
-            self.map_scene.addLine(QLineF(point, heading), QPen(Qt.white))
+            self.map_scene.addLine(QLineF(point, heading), QPen(Qt.GlobalColor.white))
         self.map_scene.setSceneRect(0, 0, grid.width, grid.height)
-        self.map_canvas.fitInView(self.map_scene.sceneRect(), Qt.KeepAspectRatio)
+        self.map_canvas.fitInView(self.map_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
-    def refresh(self):
+    def refresh(self) -> None:
         snapshot = self.runtime.snapshot()
         self.snapshot = snapshot
         key = (snapshot.epoch, snapshot.goals, snapshot.marked)
@@ -179,17 +190,24 @@ class MainWindow(widgets.QMainWindow):
         )
         packet = snapshot.camera
         self.rgb.clear()
-        self.depth.clear()
+        self.depth_preview.clear()
         if packet:
             depth = packet.depth_array()
             gray = (255 - np.clip(depth / 6000 * 255, 0, 255)).astype(np.uint8)
             gray[depth == 0] = 0
             height, width = gray.shape
-            image = QImage(gray.data, width, height, width, QImage.Format_Grayscale8).copy()
-            for label, frame in ((self.rgb, QImage.fromData(packet.jpeg)), (self.depth, image)):
-                label.setPixmap(QPixmap.fromImage(frame).scaled(label.size(), Qt.KeepAspectRatio))
+            image = QImage(gray.data, width, height, width, QImage.Format.Format_Grayscale8).copy()
+            for label, frame in (
+                (self.rgb, QImage.fromData(packet.jpeg)),
+                (self.depth_preview, image),
+            ):
+                label.setPixmap(
+                    QPixmap.fromImage(frame).scaled(
+                        label.size(), Qt.AspectRatioMode.KeepAspectRatio
+                    )
+                )
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent) -> None:
         self.timer.stop()
         self.runtime.close()
         event.accept()

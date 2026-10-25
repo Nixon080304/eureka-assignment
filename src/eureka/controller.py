@@ -1,36 +1,57 @@
 """Waypoint following, recovery, and motion safety."""
 
+from __future__ import annotations
+
 import math
 import time
 from dataclasses import dataclass
+from enum import Enum
+from typing import Literal
 
 import numpy as np
 
-from .domain import Pose, wrap_angle
+from .domain import Goal, Point, Pose, RobotInfo, Velocity, wrap_angle
+from .planning import GridPlanner
 
 DEFAULT_NAVIGATION_TIMEOUT = 300.0
 
 
+class Mode(str, Enum):
+    DISCONNECTED = "disconnected"
+    LOADING = "loading"
+    IDLE = "idle"
+    SCANNING = "scanning"
+    PLANNING = "planning"
+    WAITING = "waiting"
+    FOLLOWING = "following"
+    ALIGNING = "aligning"
+    VERIFYING = "verifying"
+    RECOVERY = "recovery"
+    BLOCKED = "blocked"
+    FAULT = "fault"
+    ARRIVED = "arrived"
+
+
 @dataclass(frozen=True)
 class Observation:
-    pose: Pose | None
-    velocity: tuple
+    pose: Pose
+    velocity: Velocity
     state_at: float
     camera_at: float
     sim_time: float
-    samples: tuple
-    trajectory: tuple
+    samples: tuple[tuple[float, Pose], ...]
+    trajectory: tuple[Point, ...]
 
 
 @dataclass
 class Decision:
-    wheels: tuple | None = None
+    wheels: Velocity | None = None
     stop: bool = False
-    request: str | None = None
+    request: Literal["plan", "mark"] | None = None
     mean: Pose | None = None
 
 
-def goal_satisfied(pose, goal, distance=0.025, angle=0.04):
+def goal_satisfied(pose: Pose, goal: Goal, distance: float = 0.025, angle: float = 0.04) -> bool:
     position_ok = pose.distance(goal.xy) <= distance
     if not position_ok:
         return False
@@ -40,7 +61,7 @@ def goal_satisfied(pose, goal, distance=0.025, angle=0.04):
     return heading_error <= angle
 
 
-def wheel_speeds(linear, angular, robot):
+def wheel_speeds(linear: float, angular: float, robot: RobotInfo) -> Velocity:
     half = robot["wheel_base"] / 2
     radius = robot["wheel_radius"]
     left = (linear - angular * half) / radius
@@ -54,18 +75,37 @@ def wheel_speeds(linear, angular, robot):
 @dataclass(frozen=True)
 class Retreat:
     origin: Pose
-    target: tuple[float, float]
+    target: Point
     deadline: float
 
 
 class Controller:
-    def __init__(self, robot=None, planner=None, *, navigation_timeout=DEFAULT_NAVIGATION_TIMEOUT):
+    def __init__(
+        self,
+        robot: RobotInfo | None = None,
+        planner: GridPlanner | None = None,
+        *,
+        navigation_timeout: float = DEFAULT_NAVIGATION_TIMEOUT,
+    ) -> None:
         if not math.isfinite(navigation_timeout) or navigation_timeout <= 0:
             raise ValueError("Navigation timeout must be finite and positive")
         self.navigation_timeout = navigation_timeout
-        self.robot = robot or {}
+        self.robot: RobotInfo = robot or {}
         self.planner = planner
-        self.mode, self.detail = "disconnected", "Connect to the simulator to begin."
+        self.mode = Mode.DISCONNECTED
+        self.detail = "Connect to the simulator to begin."
+        self.active_goal: Goal | None = None
+        self.path: list[Point] = []
+        self._scan_angle, self._scanned = 0.0, False
+        self._verify_at: float | None = None
+        self._retreat: Retreat | None = None
+        self._progress_at, self._best_distance = 0.0, math.inf
+        self._nav_at, self._plan_at, self._recoveries = 0.0, 0.0, 0
+        self.observation: Observation | None = None
+        self.decision = Decision()
+
+    def reset_episode(self, robot: RobotInfo, planner: GridPlanner) -> None:
+        self.robot, self.planner = robot, planner
         self.active_goal, self.path = None, []
         self._scan_angle, self._scanned = 0.0, False
         self._verify_at, self._retreat = None, None
@@ -73,13 +113,52 @@ class Controller:
         self._nav_at, self._plan_at, self._recoveries = 0.0, 0.0, 0
         self.observation = None
         self.decision = Decision()
+        self.mode, self.detail = Mode.IDLE, "Ready. Choose a named goal."
 
-    def cancel(self, detail):
-        self.mode, self.detail = "idle", detail
+    def begin_planning(self) -> None:
+        self.mode, self.detail = Mode.PLANNING, "Planning a path with robot clearance."
+
+    def accept_path(self, route: list[Point], pose: Pose, now: float) -> None:
+        assert self.active_goal is not None
+        if len(route) > 1:
+            self.path = list(route[1:])
+        else:
+            self.path = list(route)
+        self._progress_at = self._plan_at = now
+        self._best_distance = pose.distance(self.active_goal.xy)
+        self.mode, self.detail = Mode.WAITING, "Waiting for fresh streams after planning."
+
+    def planning_failed(self, reason: str) -> None:
+        self.mode, self.detail = Mode.BLOCKED, f"No safe path: {reason}"
+        self.path = []
+
+    def contact(self, observation: Observation, now: float) -> None:
+        if self.mode == Mode.RECOVERY:
+            self._retreat = None
+            self.mode, self.detail = (
+                Mode.SCANNING,
+                "New contact during retreat. Scanning without translation.",
+            )
+            self._scan_angle = 0.0
+        elif self.mode in (Mode.FOLLOWING, Mode.ALIGNING, Mode.VERIFYING):
+            self.recover(observation, now)
+
+    def arrival_confirmed(self, name: str) -> None:
+        self.mode, self.detail = Mode.ARRIVED, f"Reached and marked {name}."
+        self.path = []
+
+    def fault(self, detail: str) -> None:
+        self.mode, self.detail = Mode.FAULT, detail
+
+    def disconnect(self, detail: str) -> None:
+        self.mode, self.detail = Mode.DISCONNECTED, detail
+
+    def cancel(self, detail: str) -> None:
+        self.mode, self.detail = Mode.IDLE, detail
         self.active_goal, self.path, self._verify_at = None, [], None
         self._zero()
 
-    def navigate(self, goal, observation, now):
+    def navigate(self, goal: Goal, observation: Observation, now: float) -> Decision:
         self.observation = observation
         self.decision = Decision()
         self.active_goal = goal
@@ -87,43 +166,43 @@ class Controller:
         self._nav_at = self._progress_at = now
         self._best_distance = observation.pose.distance(goal.xy)
         if goal_satisfied(observation.pose, goal):
-            self.mode, self.detail = "verifying", "Holding position to verify goal tolerance."
+            self.mode, self.detail = Mode.VERIFYING, "Holding position to verify goal tolerance."
             self._verify_at = None
         elif not self._scanned:
-            self.mode, self.detail = "scanning", "Scanning for obstacles missing from the map."
+            self.mode, self.detail = Mode.SCANNING, "Scanning for obstacles missing from the map."
             self._scan_angle = 0.0
         else:
             self._plan()
         return self.decision
 
-    def step(self, observation, now):
+    def step(self, observation: Observation, now: float) -> Decision:
         self.observation = observation
         self.decision = Decision()
         self._control(now)
         return self.decision
 
-    def observe_pose(self, previous, current):
-        if self.mode == "scanning" and previous is not None:
+    def observe_pose(self, previous: Pose | None, current: Pose) -> None:
+        if self.mode == Mode.SCANNING and previous is not None:
             self._scan_angle += abs(wrap_angle(current.yaw - previous.yaw))
 
-    def _zero(self):
+    def _zero(self) -> None:
         self.decision.wheels = (0.0, 0.0)
         self.decision.stop = True
 
-    def _drive(self, linear, angular):
+    def _drive(self, linear: float, angular: float) -> None:
         self.decision.wheels = wheel_speeds(linear, angular, self.robot)
         self.decision.stop = False
 
-    def _plan(self):
+    def _plan(self) -> None:
         self.decision.request = "plan"
 
-    def recover(self, observation, now):
+    def recover(self, observation: Observation, now: float) -> None:
         self.observation = observation
         pose = observation.pose
         self._recoveries += 1
         self._retreat = None
         if self._recoveries > 3:
-            self.mode, self.detail = "blocked", "Repeated contact. Stopped for operator review."
+            self.mode, self.detail = Mode.BLOCKED, "Repeated contact. Stopped for operator review."
             return
         target = (
             pose.x - 0.06 * math.cos(pose.yaw),
@@ -139,18 +218,21 @@ class Controller:
                 if sideways_distance <= 0.01:
                     visited = True
                     break
+        assert self.planner is not None
         if not visited or not self.planner.segment_clear((pose.x, pose.y), target):
             self.mode, self.detail = (
-                "scanning",
+                Mode.SCANNING,
                 "Contact bearing unknown. Scanning without translation.",
             )
             self._scan_angle = 0.0
             self._scanned = False
             return
         self._retreat = Retreat(pose, target, now + 2.0)
-        self.mode, self.detail = "recovery", "Retreating at most 6 cm on a checked segment."
+        self.mode, self.detail = Mode.RECOVERY, "Retreating at most 6 cm on a checked segment."
 
-    def _motion_clear(self, linear, angular):
+    def _motion_clear(self, linear: float, angular: float) -> bool:
+        assert self.observation is not None
+        assert self.planner is not None
         velocity = self.observation.velocity
         return self.planner.motion_clear(
             self.observation.pose,
@@ -162,28 +244,30 @@ class Controller:
             + max(0.0, time.monotonic() - self.observation.state_at),
         )
 
-    def _control(self, now):
+    def _control(self, now: float) -> None:
+        assert self.observation is not None
         pose = self.observation.pose
         moving = self.mode in (
-            "scanning",
-            "waiting",
-            "following",
-            "aligning",
-            "verifying",
-            "recovery",
+            Mode.SCANNING,
+            Mode.WAITING,
+            Mode.FOLLOWING,
+            Mode.ALIGNING,
+            Mode.VERIFYING,
+            Mode.RECOVERY,
         )
         if not moving:
             self._zero()
             return
         if now - self.observation.state_at > 0.20:
             self.cancel("State stream is stale. Select the goal again after reconnection.")
-            self.mode = "fault"
+            self.mode = Mode.FAULT
             return
         if self.active_goal is not None and now - self._nav_at > self.navigation_timeout:
             self.cancel(f"Navigation exceeded {self.navigation_timeout:g} seconds.")
-            self.mode = "blocked"
+            self.mode = Mode.BLOCKED
             return
-        if self.mode == "waiting":
+        if self.mode == Mode.WAITING:
+            assert self.active_goal is not None
             self._zero()
             if (
                 self.observation.state_at >= self._plan_at
@@ -191,13 +275,13 @@ class Controller:
                 and now - self.observation.state_at <= 0.10
                 and now - self.observation.camera_at <= 0.25
             ):
-                self.mode = "following"
+                self.mode = Mode.FOLLOWING
                 self.detail = f"Following path to {self.active_goal.name}."
             elif now - self._plan_at > 3:
                 self.cancel("Fresh streams did not arrive after planning. Motors remain stopped.")
-                self.mode = "fault"
+                self.mode = Mode.FAULT
             return
-        if self.mode == "scanning":
+        if self.mode == Mode.SCANNING:
             if now - self.observation.camera_at > 0.7:
                 self._zero()
                 self.detail = "Waiting for a fresh RGBD camera frame."
@@ -209,7 +293,8 @@ class Controller:
                 return
             self._drive(0.0, 1.0)
             return
-        if self.mode == "recovery":
+        if self.mode == Mode.RECOVERY:
+            assert self.planner is not None
             retreat = self._retreat
             if retreat is None:
                 progress = 0.0
@@ -235,7 +320,7 @@ class Controller:
                 self._zero()
                 self._retreat = None
                 self.mode, self.detail = (
-                    "scanning",
+                    Mode.SCANNING,
                     "Retreat no longer clear. Scanning without translation.",
                 )
                 self._scan_angle = 0.0
@@ -249,7 +334,7 @@ class Controller:
         distance = pose.distance(goal.xy)
         if distance < self._best_distance - 0.025:
             self._best_distance, self._progress_at = distance, now
-        if now - self._progress_at > 15 and self.mode == "following":
+        if now - self._progress_at > 15 and self.mode == Mode.FOLLOWING:
             self._plan()
             return
         if distance <= 0.020:
@@ -258,20 +343,21 @@ class Controller:
             else:
                 error = wrap_angle(goal.yaw - pose.yaw)
             if abs(error) > 0.030:
-                self.mode, self.detail = "aligning", "Aligning final goal heading."
+                self.mode, self.detail = Mode.ALIGNING, "Aligning final goal heading."
                 self._drive(0.0, float(np.clip(2.2 * error, -0.8, 0.8)))
             else:
-                self.mode, self.detail = "verifying", "Verifying stable position and heading."
+                self.mode, self.detail = Mode.VERIFYING, "Verifying stable position and heading."
                 self._zero()
                 self._verify(now)
             return
         self._verify_at = None
-        self.mode = "following"
+        self.mode = Mode.FOLLOWING
         self.detail = f"Following path to {goal.name}."
         if now - self.observation.camera_at > 0.55:
             self.cancel("Camera stream is stale. Stopped before moving into unseen space.")
-            self.mode = "fault"
+            self.mode = Mode.FAULT
             return
+        assert self.planner is not None
         while len(self.path) > 1 and pose.distance(self.path[0]) < 0.10:
             if not self.planner.segment_clear((pose.x, pose.y), self.path[1]):
                 if not self.planner.segment_clear(self.path[0], self.path[1]):
@@ -309,7 +395,9 @@ class Controller:
             return
         self._drive(linear, angular)
 
-    def _verify(self, now):
+    def _verify(self, now: float) -> None:
+        assert self.observation is not None
+        assert self.active_goal is not None
         pose = self.observation.pose
         if not goal_satisfied(pose, self.active_goal):
             self._verify_at = None

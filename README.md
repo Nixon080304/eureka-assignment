@@ -91,6 +91,18 @@ For offline processing, use the original frames and `frames.jsonl` for timing. T
 
 Read the camera calibration from `manifest.json` under `metadata.camera`. Multiply depth values by `depth_scale` to obtain metres. Zero depth means invalid or out of range. Depth measures distance along the camera's optical axis. There is no depth video; the depth arrays retain the original measurements.
 
+## Automated checks
+
+Install the locked development dependencies and run the tests and type checker:
+
+```bash
+uv sync --locked
+uv run pytest
+uv run mypy
+```
+
+The pytest suite covers planner geometry and obstacle mapping, controller decisions and recovery, and runtime stop, reset, command delivery, and goal marking. These tests run without Docker or a desktop session. Mypy checks all application source modules. Pytest, mypy, and SciPy type stubs are development dependencies.
+
 ## Test manually
 
 Run the following checks with the simulator and application open:
@@ -117,4 +129,3 @@ The assignment's arrival limits are 5 cm in position and 5 degrees for goals wit
 ## AI assistance
 
 I used OpenAI Codex to brainstorm motion planning and control algorithms, review and validate the code whether it matches the requirements, and prepare documentation.
-  

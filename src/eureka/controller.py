@@ -22,24 +22,28 @@ DEFAULT_NAVIGATION_TIMEOUT = 300.0
 
 
 class PoseEstimate:
-    def __init__(self, robot: dict, initial: Pose | None = None):
+    def __init__(self, robot, initial=None):
         self.robot = robot
         self.pose = initial
         self.ticks = None
         self.t = None
         self.velocity = (0.0, 0.0)
 
-    def update(self, state: dict) -> Pose:
+    def update(self, state):
         measured = Pose.from_dict(state["pose"])
         ticks = state["wheels"]["left_ticks"], state["wheels"]["right_ticks"]
         if self.pose is None:
             self.pose = measured
         if self.ticks is not None:
             scale = 2 * math.pi * self.robot["wheel_radius"] / self.robot["ticks_per_rev"]
-            left, right = ((ticks[i] - self.ticks[i]) * scale for i in (0, 1))
+            left = (ticks[0] - self.ticks[0]) * scale
+            right = (ticks[1] - self.ticks[1]) * scale
             distance = (left + right) / 2
             angle = (right - left) / self.robot["wheel_base"]
-            elapsed = float(state.get("t", 0.0)) - self.t if self.t is not None else 0.0
+            if self.t is not None:
+                elapsed = float(state.get("t", 0.0)) - self.t
+            else:
+                elapsed = 0.0
             if elapsed > 0:
                 self.velocity = distance / elapsed, angle / elapsed
             p = self.pose
@@ -60,17 +64,24 @@ class PoseEstimate:
         return self.pose
 
 
-def goal_satisfied(pose: Pose, goal: Goal, distance: float = 0.025, angle: float = 0.04) -> bool:
-    return pose.distance(goal.xy) <= distance and (
-        goal.yaw is None or abs(wrap_angle(goal.yaw - pose.yaw)) <= angle
-    )
+def goal_satisfied(pose, goal, distance=0.025, angle=0.04):
+    position_ok = pose.distance(goal.xy) <= distance
+    if not position_ok:
+        return False
+    if goal.yaw is None:
+        return True
+    heading_error = abs(wrap_angle(goal.yaw - pose.yaw))
+    return heading_error <= angle
 
 
-def wheel_speeds(linear: float, angular: float, robot: dict) -> tuple[float, float]:
+def wheel_speeds(linear, angular, robot):
     half = robot["wheel_base"] / 2
     radius = robot["wheel_radius"]
-    left, right = (linear - angular * half) / radius, (linear + angular * half) / radius
-    factor = max(1.0, abs(left) / robot["max_wheel_speed"], abs(right) / robot["max_wheel_speed"])
+    left = (linear - angular * half) / radius
+    right = (linear + angular * half) / radius
+    left_ratio = abs(left) / robot["max_wheel_speed"]
+    right_ratio = abs(right) / robot["max_wheel_speed"]
+    factor = max(1.0, left_ratio, right_ratio)
     return left / factor, right / factor
 
 
@@ -84,10 +95,10 @@ class Retreat:
 class Controller:
     def __init__(
         self,
-        host: str = "localhost",
-        port_base: int = 5555,
+        host="localhost",
+        port_base=5555,
         *,
-        navigation_timeout: float = DEFAULT_NAVIGATION_TIMEOUT,
+        navigation_timeout=DEFAULT_NAVIGATION_TIMEOUT,
     ):
         if not math.isfinite(navigation_timeout) or navigation_timeout <= 0:
             raise ValueError("Navigation timeout must be finite and positive")
@@ -117,7 +128,7 @@ class Controller:
         self._control_at, self._publish_at, self._trajectory_at = 0.0, 0.0, 0.0
         self._scan_angle, self._scanned = 0.0, False
         self._verify_at = None
-        self._retreat: Retreat | None = None
+        self._retreat = None
         self._progress_at, self._best_distance = 0.0, math.inf
         self._nav_at = 0.0
         self._plan_at = 0.0
@@ -127,12 +138,12 @@ class Controller:
         self._estimator = None
         self.events = deque(maxlen=500)
 
-    def start(self) -> None:
+    def start(self):
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, name="eureka-control", daemon=True)
             self._thread.start()
 
-    def submit(self, action: str, **kwargs) -> None:
+    def submit(self, action, **kwargs):
         if action == "stop":
             self._stop.set()
             while True:
@@ -146,11 +157,11 @@ class Controller:
             self._stop.set()
             raise RuntimeError("Command queue is full; robot stop requested") from exc
 
-    def snapshot(self) -> Snapshot:
+    def snapshot(self):
         with self._lock:
             return self._snapshot
 
-    def close(self, timeout: float | None = None) -> None:
+    def close(self, timeout=None):
         self._stop.set()
         self._shutdown.set()
         if self._thread is not None:
@@ -158,23 +169,23 @@ class Controller:
             if self._thread.is_alive():
                 raise TimeoutError("Motors stopped; recording finalization is still running")
 
-    def _event(self, event: str, **data) -> None:
+    def _event(self, event, **data):
         self.events.append({"event": event, "t": self.state.get("t"), **data})
 
-    def _zero(self) -> None:
+    def _zero(self):
         if self.sim is not None:
             if self.sim.wheels():
                 self._command_failures = 0
             self._control_at = time.monotonic()
 
-    def _halt(self) -> None:
+    def _halt(self):
         self._zero()
         until = time.monotonic() + 0.28
         while time.monotonic() < until:
             self._zero()
             time.sleep(0.025)
 
-    def _run(self) -> None:
+    def _run(self):
         self.sim = Simulator(self.host, self.port_base)
         self.recorder = Recorder()
         try:
@@ -212,13 +223,20 @@ class Controller:
             self.mode, self.detail = "disconnected", "Disconnected. Motors stopped."
             self._publish()
 
-    def _action(self, action: str, args: dict) -> None:
+    def _action(self, action, args):
         if action in ("connect", "load_scene"):
-            self._bootstrap(args if action == "load_scene" else None)
+            if action == "load_scene":
+                self._bootstrap(args)
+            else:
+                self._bootstrap(None)
         elif action == "navigate":
             if not self.connected or self.pose is None:
                 raise RuntimeError("Wait for a connected simulator and fresh pose")
-            goal = next((g for g in self.goals if g.name == args["name"]), None)
+            goal = None
+            for candidate in self.goals:
+                if candidate.name == args["name"]:
+                    goal = candidate
+                    break
             if goal is None:
                 raise ValueError("Unknown named goal")
             self._cancel("Preparing navigation.")
@@ -239,22 +257,26 @@ class Controller:
         elif action == "start_recording":
             if not self.connected or self.grid is None:
                 raise RuntimeError("Connect before recording")
-            self.recorder.start(
-                Path(args.get("directory", "recordings")),
-                {
-                    "source_sha256": {
-                        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                        for p in sorted(Path(__file__).parent.glob("*.py"))
-                    },
-                    "scene": self.scene,
-                    "seed": self.seed,
-                    "epoch": self.epoch,
-                    "robot": self.robot,
-                    "camera": self.calibration,
-                    "map": self.map_info,
-                    "goals": [g.__dict__ for g in self.goals],
-                },
-            )
+            directory = Path(args.get("directory", "recordings"))
+            source_hashes = {}
+            for source_file in sorted(Path(__file__).parent.glob("*.py")):
+                source_hashes[source_file.name] = hashlib.sha256(
+                    source_file.read_bytes()
+                ).hexdigest()
+            goals = []
+            for goal in self.goals:
+                goals.append(goal.__dict__)
+            metadata = {
+                "source_sha256": source_hashes,
+                "scene": self.scene,
+                "seed": self.seed,
+                "epoch": self.epoch,
+                "robot": self.robot,
+                "camera": self.calibration,
+                "map": self.map_info,
+                "goals": goals,
+            }
+            self.recorder.start(directory, metadata)
         elif action == "stop_recording":
             self._cancel("Stopped while finalizing camera recording.")
             self._halt()
@@ -268,13 +290,16 @@ class Controller:
         else:
             raise ValueError(f"Unknown application command: {action}")
 
-    def _cancel(self, detail: str) -> None:
+    def _cancel(self, detail):
         self._zero()
-        self.mode = "idle" if self.connected else "disconnected"
+        if self.connected:
+            self.mode = "idle"
+        else:
+            self.mode = "disconnected"
         self.detail = detail
         self.active_goal, self.path, self._verify_at = None, [], None
 
-    def _bootstrap(self, load: dict | None) -> None:
+    def _bootstrap(self, load):
         self.mode, self.detail = "loading", "Stopping motors and loading simulator metadata."
         self._publish()
         self._halt()
@@ -298,7 +323,10 @@ class Controller:
         self.robot, _ = self.sim.call("get_robot_info")
         self.calibration, _ = self.sim.call("get_camera_info")
         values, _ = self.sim.call("get_goals")
-        self.goals = tuple(Goal.from_dict(g) for g in values)
+        goals = []
+        for value in values:
+            goals.append(Goal.from_dict(value))
+        self.goals = tuple(goals)
         self.grid, self.map_info, self._map_png = self.sim.get_map()
         self.planner = GridPlanner(
             self.grid, radius=float(self.robot["radius"]), height=float(self.robot["height"])
@@ -319,16 +347,17 @@ class Controller:
         self.mode, self.detail = "idle", "Ready. Choose a named goal."
         self._event("episode", scene=self.scene, epoch=self.epoch, seed=self.seed)
 
-    def _receive_states(self) -> bool:
+    def _receive_states(self):
         states = self.sim.states()
         for state in states:
-            if self.state and (
-                state["scene"] != self.state["scene"]
-                or (
-                    state["t"] < self.state["t"] - 0.25
-                    and (state["seq"] > self.state["seq"] or state["seq"] < self.state["seq"] - 10)
-                )
-            ):
+            external_reset = False
+            if self.state:
+                if state["scene"] != self.state["scene"]:
+                    external_reset = True
+                elif state["t"] < self.state["t"] - 0.25:
+                    if state["seq"] > self.state["seq"] or state["seq"] < self.state["seq"] - 10:
+                        external_reset = True
+            if external_reset:
                 self._halt()
                 self.marked.clear()
                 self._mark_attempts.clear()
@@ -344,9 +373,10 @@ class Controller:
             self._pose_history.append((float(state["t"]), self.pose))
             now = time.monotonic()
             offset = now - float(state["t"])
-            self._sim_clock_offset = (
-                offset if self._sim_clock_offset is None else min(self._sim_clock_offset, offset)
-            )
+            if self._sim_clock_offset is None:
+                self._sim_clock_offset = offset
+            else:
+                self._sim_clock_offset = min(self._sim_clock_offset, offset)
             self._state_at = min(now, float(state["t"]) + self._sim_clock_offset)
             self._samples.append((state["t"], Pose.from_dict(state["pose"])))
             self.recorder.offer_state(state)
@@ -371,7 +401,7 @@ class Controller:
             self._bumper_before = bool(state["bumper"])
         return True
 
-    def _receive(self) -> None:
+    def _receive(self):
         if not self._receive_states():
             return
         packets = self.sim.cameras()
@@ -384,9 +414,10 @@ class Controller:
             self.camera = packet
             now = time.monotonic()
             offset = now - packet.t
-            self._sim_clock_offset = (
-                offset if self._sim_clock_offset is None else min(self._sim_clock_offset, offset)
-            )
+            if self._sim_clock_offset is None:
+                self._sim_clock_offset = offset
+            else:
+                self._sim_clock_offset = min(self._sim_clock_offset, offset)
             self._camera_at = min(now, packet.t + self._sim_clock_offset)
         if packets and self.camera is not None and time.monotonic() - self._depth_at > 0.2:
             self._depth_at = time.monotonic()
@@ -403,13 +434,16 @@ class Controller:
                     self._plan()
         self._receive_states()
 
-    def _capture_pose(self, capture_time: float, fallback: Pose) -> Pose:
+    def _capture_pose(self, capture_time, fallback):
         history = self._pose_history
         if not history or capture_time < history[0][0] or capture_time > history[-1][0] + 0.04:
             return fallback
         for (t0, p0), (t1, p1) in zip(history, list(history)[1:]):
             if t0 <= capture_time <= t1:
-                ratio = (capture_time - t0) / (t1 - t0) if t1 > t0 else 0.0
+                if t1 > t0:
+                    ratio = (capture_time - t0) / (t1 - t0)
+                else:
+                    ratio = 0.0
                 return Pose(
                     p0.x + ratio * (p1.x - p0.x),
                     p0.y + ratio * (p1.y - p0.y),
@@ -417,7 +451,7 @@ class Controller:
                 )
         return history[-1][1]
 
-    def _plan(self) -> None:
+    def _plan(self):
         if self.pose is None or self.active_goal is None:
             return
         self.mode, self.detail = "planning", "Planning a path with robot clearance."
@@ -442,7 +476,10 @@ class Controller:
                 dynamic_cells=int(self.planner.dynamic.sum()),
             )
             return
-        self.path = list(route[1:] if len(route) > 1 else route)
+        if len(route) > 1:
+            self.path = list(route[1:])
+        else:
+            self.path = list(route)
         self._replans += 1
         self._progress_at = time.monotonic()
         self._control_at = self._progress_at
@@ -457,7 +494,7 @@ class Controller:
             dynamic_cells=int(self.planner.dynamic.sum()),
         )
 
-    def _recover(self) -> None:
+    def _recover(self):
         self._zero()
         self._recoveries += 1
         self._retreat = None
@@ -468,12 +505,16 @@ class Controller:
             self.pose.x - 0.06 * math.cos(self.pose.yaw),
             self.pose.y - 0.06 * math.sin(self.pose.yaw),
         )
-        c, s = math.cos(self.pose.yaw), math.sin(self.pose.yaw)
-        visited = any(
-            0.065 <= -(x - self.pose.x) * c - (y - self.pose.y) * s <= 0.15
-            and abs(-(x - self.pose.x) * s + (y - self.pose.y) * c) <= 0.01
-            for x, y in list(self.trajectory)[-150:]
-        )
+        cos_yaw = math.cos(self.pose.yaw)
+        sin_yaw = math.sin(self.pose.yaw)
+        visited = False
+        for x, y in list(self.trajectory)[-150:]:
+            distance_behind = -(x - self.pose.x) * cos_yaw - (y - self.pose.y) * sin_yaw
+            if 0.065 <= distance_behind <= 0.15:
+                sideways_distance = abs(-(x - self.pose.x) * sin_yaw + (y - self.pose.y) * cos_yaw)
+                if sideways_distance <= 0.01:
+                    visited = True
+                    break
         if not visited or not self.planner.segment_clear((self.pose.x, self.pose.y), target):
             self.mode, self.detail = (
                 "scanning",
@@ -485,8 +526,11 @@ class Controller:
         self._retreat = Retreat(self.pose, target, time.monotonic() + 2.0)
         self.mode, self.detail = "recovery", "Retreating at most 6 cm on a checked segment."
 
-    def _motion_clear(self, linear: float, angular: float) -> bool:
-        velocity = self._estimator.velocity if self._estimator is not None else (0.0, 0.0)
+    def _motion_clear(self, linear, angular):
+        if self._estimator is not None:
+            velocity = self._estimator.velocity
+        else:
+            velocity = (0.0, 0.0)
         return self.planner.motion_clear(
             self.pose,
             linear,
@@ -496,7 +540,7 @@ class Controller:
             self.robot.get("watchdog", 0.25) + max(0.0, time.monotonic() - self._state_at),
         )
 
-    def _control(self, now: float) -> None:
+    def _control(self, now):
         moving = self.mode in (
             "scanning",
             "waiting",
@@ -549,15 +593,16 @@ class Controller:
             return
         if self.mode == "recovery":
             retreat = self._retreat
-            progress = (
-                0.0
-                if retreat is None
-                else (
-                    (retreat.origin.x - self.pose.x) * math.cos(retreat.origin.yaw)
-                    + (retreat.origin.y - self.pose.y) * math.sin(retreat.origin.yaw)
-                )
-            )
-            velocity = self._estimator.velocity if self._estimator is not None else (0.0, 0.0)
+            if retreat is None:
+                progress = 0.0
+            else:
+                progress = (retreat.origin.x - self.pose.x) * math.cos(retreat.origin.yaw) + (
+                    retreat.origin.y - self.pose.y
+                ) * math.sin(retreat.origin.yaw)
+            if self._estimator is not None:
+                velocity = self._estimator.velocity
+            else:
+                velocity = (0.0, 0.0)
             reverse_speed = max(0.04, -velocity[0])
             observation_age = max(0.0, now - self._state_at)
             stopping_distance = reverse_speed * (0.05 + observation_age) + reverse_speed**2 / (
@@ -593,7 +638,10 @@ class Controller:
             self._plan()
             return
         if distance <= 0.020:
-            error = 0.0 if goal.yaw is None else wrap_angle(goal.yaw - self.pose.yaw)
+            if goal.yaw is None:
+                error = 0.0
+            else:
+                error = wrap_angle(goal.yaw - self.pose.yaw)
             if abs(error) > 0.030:
                 self.mode, self.detail = "aligning", "Aligning final goal heading."
                 self._drive(0.0, float(np.clip(2.2 * error, -0.8, 0.8)))
@@ -629,7 +677,9 @@ class Controller:
             math.atan2(target[1] - self.pose.y, target[0] - self.pose.x) - self.pose.yaw
         )
         angular = float(np.clip(2.6 * error, -1.3, 1.3))
-        linear = min(0.20, 0.9 * self.pose.distance(target)) * max(0.0, math.cos(error))
+        forward_speed = min(0.20, 0.9 * self.pose.distance(target))
+        heading_factor = max(0.0, math.cos(error))
+        linear = forward_speed * heading_factor
         if abs(error) > 0.60:
             linear = 0.0
         if self.planner._clearance((self.pose.x, self.pose.y)) < (
@@ -646,12 +696,15 @@ class Controller:
             return
         self._drive(linear, angular)
 
-    def _drive(self, linear: float, angular: float) -> None:
+    def _drive(self, linear, angular):
         if self._stop.is_set() or self._shutdown.is_set():
             self._zero()
             return
         recovering = self._command_failures > 0
-        speeds = (0.0, 0.0) if recovering else wheel_speeds(linear, angular, self.robot)
+        if recovering:
+            speeds = (0.0, 0.0)
+        else:
+            speeds = wheel_speeds(linear, angular, self.robot)
         if self.sim.wheels(*speeds):
             self._command_failures = 0
             return
@@ -662,7 +715,7 @@ class Controller:
             self.mode = "fault"
             self.detail = "Command transport unavailable. Motor watchdog will stop motion."
 
-    def _verify(self, now: float) -> None:
+    def _verify(self, now):
         if not goal_satisfied(self.pose, self.active_goal):
             self._verify_at = None
             return
@@ -671,14 +724,32 @@ class Controller:
             return
         if now - self._verify_at < 0.6 or len(self._samples) < 15:
             return
-        recent = [p for t, p in self._samples if t > self.state["t"] - 0.5]
+        recent = []
+        for sample_time, pose in self._samples:
+            if sample_time > self.state["t"] - 0.5:
+                recent.append(pose)
         if len(recent) < 15:
             return
-        mean = Pose(
-            float(np.mean([p.x for p in recent])),
-            float(np.mean([p.y for p in recent])),
-            math.atan2(sum(math.sin(p.yaw) for p in recent), sum(math.cos(p.yaw) for p in recent)),
-        )
+        x_values = []
+        for pose in recent:
+            x_values.append(pose.x)
+        mean_x = float(np.mean(x_values))
+
+        y_values = []
+        for pose in recent:
+            y_values.append(pose.y)
+        mean_y = float(np.mean(y_values))
+
+        sin_values = []
+        for pose in recent:
+            sin_values.append(math.sin(pose.yaw))
+        sin_sum = sum(sin_values)
+        cos_values = []
+        for pose in recent:
+            cos_values.append(math.cos(pose.yaw))
+        cos_sum = sum(cos_values)
+        mean_yaw = math.atan2(sin_sum, cos_sum)
+        mean = Pose(mean_x, mean_y, mean_yaw)
         if not goal_satisfied(mean, self.active_goal, 0.030, 0.05):
             return
         name = self.active_goal.name
@@ -703,13 +774,16 @@ class Controller:
         self.mode, self.detail = "arrived", f"Reached and marked {name}."
         self.path = []
 
-    def _publish(self) -> None:
+    def _publish(self):
         now = time.monotonic()
         dynamic = None
         if self.planner is not None:
             dynamic = self.planner.dynamic.copy()
             dynamic.flags.writeable = False
-        record = self.recorder.status() if self.recorder is not None else {}
+        if self.recorder is not None:
+            record = self.recorder.status()
+        else:
+            record = {}
         value = Snapshot(
             connected=self.connected,
             scene=self.scene,

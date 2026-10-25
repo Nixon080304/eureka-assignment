@@ -105,3 +105,8 @@ The assignment's arrival limits are 5 cm in position and 5 degrees for goals wit
 - FFmpeg exports RGB frames as H.264 video.
 - uv manages Python dependencies and the virtual environment. Hatchling builds the Python package during installation.
 - Docker runs the supplied simulator. Git tracks the source code, and GitHub hosts the repository.
+
+## AI assistance
+
+I used OpenAI Codex to brainstorm motion planning and control algorithms, review and validate the code whether it matches the requirements, and prepare documentation.
+  

@@ -10,11 +10,12 @@ The source separates the main responsibilities:
 - `transport.py` owns the ZeroMQ protocol, message decoding, and RPC timeouts.
 - `domain.py` defines poses, goals, map coordinates, camera packets, and UI snapshots.
 - `planning.py` handles obstacle mapping, A* search, and collision checks.
-- `controller.py` estimates pose, follows waypoints, handles navigation states, and marks arrivals.
+- `controller.py` follows waypoints, checks motion safety, handles recovery, and verifies arrival tolerances.
+- `runtime.py` receives sensor data, estimates pose, runs planning, sends wheel commands, and marks arrivals.
 - `recording.py` writes camera and state data.
 - `ui.py` displays snapshots and submits user commands.
 
-The Qt thread handles the interface. One controller thread owns the simulator sockets and navigation state. The UI submits queued commands and reads snapshots. A separate recorder thread handles disk writes.
+The Qt thread handles the interface. One runtime thread owns the simulator sockets and calls the motion controller. The controller receives observations and returns wheel commands or requests for planning and goal marking. The UI submits queued commands and reads snapshots from the runtime. A separate recorder thread handles disk writes.
 
 ## Planning and obstacle detection
 
@@ -22,13 +23,13 @@ The planner combines the supplied map with depth observations. It expands obstac
 
 A clear straight route avoids grid search. Otherwise, A* uses travelled distance and a Euclidean distance estimate. Smoothing removes intermediate points only when the connecting segment passes a swept-disc collision check. Subdivision limits waypoint spacing to 0.5 m and preserves the requested endpoint.
 
-Depth pixels are projected through camera calibration into robot and world coordinates using the capture pose. The controller interpolates pose history when available. Only points in the robot's collision height band contribute evidence. Confirmation requires multiple returns in a cell and nearby support from an earlier capture. This reduces noise but delays detection. Confirmed obstacles remain until the scene reloads.
+Depth pixels are projected through camera calibration into robot and world coordinates using the capture pose. The runtime interpolates pose history when available. Only points in the robot's collision height band contribute evidence. Confirmation requires multiple returns in a cell and nearby support from an earlier capture. This reduces noise but delays detection. Confirmed obstacles remain until the scene reloads.
 
 An initial rotation gathers observations before the first route. Obstacles obstructing the next segment can trigger replanning. Distance transforms and a spatial tree are cached until the map changes. Conservative clearance can reject passages that the physical robot could traverse.
 
 ## Motion control and robustness
 
-The controller combines wheel-encoder odometry with gradual correction toward the reported pose to reduce jitter. It follows waypoints using heading error and distance, reducing speed during turns. Commands become differential wheel speeds using published robot dimensions and limits.
+The runtime combines wheel-encoder odometry with gradual correction toward the reported pose to reduce jitter. The controller follows waypoints using heading error and distance, reducing speed during turns. Commands become differential wheel speeds using published robot dimensions and limits.
 
 Wheel commands are requested at 20 Hz. The simulator applies its own 100 Hz kinematics and acceleration limits. Normal forward speed is capped at 0.20 m/s, below the published maximum. Before forward or retreat motion, the planner checks a predicted arc and braking trajectory using estimated velocity, acceleration limits, and the watchdog interval.
 
@@ -46,7 +47,7 @@ The UI shows the map, detected obstacles, trajectory, goals, planned path, and R
 
 The design assumes a static environment within each scene, valid calibration, and the simulator's published frame and depth conventions. It uses the supplied pose stream as a correction source rather than performing SLAM. The forward camera cannot observe all surroundings at once, and false obstacle confirmations cannot currently be cleared.
 
-Planning runs synchronously in the controller thread with the robot stopped. Large searches and repeated smoothing checks delay control processing. Recording finalisation also waits for video export. Initial scanning adds startup delay, and the waypoint follower can pause or turn sharply near corners. Conservative margins and limited recovery do not guarantee arrival at every reachable goal.
+Planning runs synchronously in the runtime thread with the robot stopped. Large searches and repeated smoothing checks delay control processing. Recording finalisation also waits for video export. Initial scanning adds startup delay, and the waypoint follower can pause or turn sharply near corners. Conservative margins and limited recovery do not guarantee arrival at every reachable goal.
 
 A verified Eureka demo reached `kitchen` on scene `01`, seed `18`, with no observed bumper events or recording queue drops. Stop, video export, and shutdown also completed. This single run does not establish coverage across all scenes or starts. The repository currently provides manual test instructions rather than an automated test suite.
 

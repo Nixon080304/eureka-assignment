@@ -9,9 +9,9 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QPixmap
 
 
 class MainWindow(widgets.QMainWindow):
-    def __init__(self, controller):
+    def __init__(self, runtime):
         super().__init__()
-        self.controller = controller
+        self.runtime = runtime
         self.goal_key = None
         self.setWindowTitle("Eureka - minimal UI")
         self.resize(1100, 720)
@@ -73,7 +73,7 @@ class MainWindow(widgets.QMainWindow):
 
     def submit(self, action, **kwargs):
         try:
-            self.controller.submit(action, **kwargs)
+            self.runtime.submit(action, **kwargs)
         except Exception as error:
             self.detail.setText(str(error))
 
@@ -87,7 +87,7 @@ class MainWindow(widgets.QMainWindow):
         self.submit("stop")
 
     def record(self):
-        if self.controller.snapshot().recording.get("active"):
+        if self.runtime.snapshot().recording.get("active"):
             self.submit("stop_recording")
         else:
             self.submit("start_recording", directory=self.folder.text().strip() or "recordings")
@@ -139,7 +139,7 @@ class MainWindow(widgets.QMainWindow):
         self.map_canvas.fitInView(self.map_scene.sceneRect(), Qt.KeepAspectRatio)
 
     def refresh(self):
-        snapshot = self.controller.snapshot()
+        snapshot = self.runtime.snapshot()
         self.snapshot = snapshot
         key = (snapshot.epoch, snapshot.goals, snapshot.marked)
         if key != self.goal_key:
@@ -191,5 +191,5 @@ class MainWindow(widgets.QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
-        self.controller.close()
+        self.runtime.close()
         event.accept()
